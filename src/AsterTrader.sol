@@ -229,7 +229,7 @@ contract AsterTrader {
         cycle.active = false;
         cycle.exitPrice = exitPrice;
 
-        int256 cycleNetCashFlow = int256(actualUsdtReceived) - int256(uint256(cycle.marginUSDT));
+        int256 cycleNetCashFlow = SafeCast.toInt256(actualUsdtReceived) - int256(uint256(cycle.marginUSDT));
         cycle.netCashFlow = cycleNetCashFlow;
 
         totalNetCashFlow += cycleNetCashFlow;
