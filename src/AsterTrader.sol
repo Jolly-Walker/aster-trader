@@ -20,14 +20,14 @@ contract AsterTrader {
     // Trade Cycle Tracking
     struct TradeCycle {
         bytes32 tradeHash; // The unique hash of the position on Aster DEX
+        uint256 startTime;
+        uint256 endTime;
+        int256 netCashFlow; // Realized net cash flow in USDT after all fees (18 decimals)
         uint96 marginUSDT; // USDT margin spent
         uint80 qtyBTC; // BTC quantity in 1e10
         uint64 entryPrice; // BTC price in 1e8 when opened
         uint64 exitPrice; // BTC price in 1e8 when closed
-        int256 netCashFlow; // Realized net cash flow in USDT after all fees (18 decimals)
         bool active; // True if bought but not yet closed
-        uint256 startTime;
-        uint256 endTime;
     }
 
     TradeCycle[] public tradeCycles;
