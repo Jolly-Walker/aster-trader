@@ -114,11 +114,15 @@ contract MockAsterDex is IAsterDex {
         require(data.pairBase == BTC_PAIR_BASE, "MockAsterDex: invalid pairBase");
 
         // Pull USDT margin from the sender (AsterTrader)
-        MockUSDT(USDT).transferFrom(msg.sender, address(this), data.amountIn);
+        bool success = MockUSDT(USDT).transferFrom(msg.sender, address(this), data.amountIn);
+        require(success, "MockAsterDex: transferFrom failed");
 
         // Generate unique tradeHash
         bytes32 tradeHash = keccak256(abi.encodePacked(msg.sender, nonce, data.qty));
         nonce++;
+
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 entryPriceUint64 = uint64(btcPrice);
 
         // Save position details
         positions[tradeHash] = Position({
@@ -129,7 +133,7 @@ contract MockAsterDex is IAsterDex {
             isLong: data.isLong,
             margin: data.amountIn,
             qty: data.qty,
-            entryPrice: uint64(btcPrice),
+            entryPrice: entryPriceUint64,
             stopLoss: data.stopLoss,
             takeProfit: data.takeProfit,
             openFee: 0,
@@ -152,13 +156,16 @@ contract MockAsterDex is IAsterDex {
         Position memory pos = positions[tradeHash];
         require(pos.margin > 0, "MockAsterDex: position not found");
 
-        // Calculate realized PnL
-        // price (8 decimals) * qty (10 decimals) = PnL (18 decimals)
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int256 signedBtcPrice = int256(btcPrice);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int256 signedEntryPrice = int256(uint256(pos.entryPrice));
+
         int256 priceDiff;
         if (pos.isLong) {
-            priceDiff = int256(btcPrice) - int256(uint256(pos.entryPrice));
+            priceDiff = signedBtcPrice - signedEntryPrice;
         } else {
-            priceDiff = int256(uint256(pos.entryPrice)) - int256(btcPrice);
+            priceDiff = signedEntryPrice - signedBtcPrice;
         }
 
         int256 pnl = priceDiff * int256(uint256(pos.qty));
@@ -182,7 +189,10 @@ contract MockAsterDex is IAsterDex {
 
         // Send payout back to caller
         if (payout > 0) {
-            MockUSDT(USDT).transfer(msg.sender, uint256(payout));
+            // forge-lint: disable-next-line(unsafe-typecast)
+            uint256 payoutAmt = uint256(payout);
+            bool transferSuccess = MockUSDT(USDT).transfer(msg.sender, payoutAmt);
+            require(transferSuccess, "MockAsterDex: transfer failed");
         }
 
         emit CloseTradeSuccessful(msg.sender, tradeHash, "");

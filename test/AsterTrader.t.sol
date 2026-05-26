@@ -198,7 +198,7 @@ contract AsterTraderTest is Test {
 
     function testExecuteBuyAndSell_Loss() public {
         // Step 1: Deposit USDT
-        uint256 depositAmt = 60_000 * 1e18;
+        uint96 depositAmt = 60_000 * 1e18;
         usdt.approve(address(trader), depositAmt);
         trader.depositUSDT(depositAmt);
 
@@ -206,7 +206,7 @@ contract AsterTraderTest is Test {
         router.setBtcPrice(60_000 * 1e8);
 
         // Step 2: Buy
-        trader.executeBuy(uint96(depositAmt), 1 * 1e10, 60_000 * 1e8, 0, 0);
+        trader.executeBuy(depositAmt, 1 * 1e10, 60_000 * 1e8, 0, 0);
 
         IAsterDex.Position[] memory openPositions = trader.getMyPositions();
         bytes32 tradeHash = openPositions[0].positionHash;
@@ -364,13 +364,15 @@ contract AsterTraderTest is Test {
         router.setBtcPrice(60_000 * 1e8);
         trader.executeBuy(60_000 * 1e18, 1 * 1e10, 60_000 * 1e8, 0, 0);
 
+        bytes32 dummyHash = keccak256("dummy");
         vm.expectRevert("AsterTrader: position not found on Aster");
-        trader.executeSell(0, bytes32(hex"12345678"));
+        trader.executeSell(0, dummyHash);
     }
 
     function testCannotSellNonExistentCycle() public {
+        bytes32 dummyHash = keccak256("dummy");
         vm.expectRevert("AsterTrader: invalid trade cycle ID");
-        trader.executeSell(999, bytes32(hex"12345678"));
+        trader.executeSell(999, dummyHash);
     }
 
     function testCannotBuyWithInsufficientUSDT() public {

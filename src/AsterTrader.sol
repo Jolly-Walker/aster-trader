@@ -2,6 +2,7 @@
 pragma solidity ^0.8.19;
 
 import {IAsterDex, IERC20, ASTER_DEX, BTC_PAIR_BASE, USDT} from "./Interface/IAsterDex.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 /**
  * @title AsterTrader
