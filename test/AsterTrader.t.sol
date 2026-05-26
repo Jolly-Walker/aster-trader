@@ -79,7 +79,7 @@ contract AsterTraderTest is Test {
         uint256 balanceAfter = usdt.balanceOf(owner);
         assertEq(balanceAfter - balanceBefore, depositAmt);
 
-        (uint256 usdtBal, ) = trader.getBalances();
+        (uint256 usdtBal,) = trader.getBalances();
         assertEq(usdtBal, 0);
     }
 
@@ -112,14 +112,14 @@ contract AsterTraderTest is Test {
 
         // Step 2: Execute Buy of 1 BTC position
         uint96 usdtMargin = 60_000 * 1e18;
-        uint80 btcQty = 1 * 1e10; 
-        
+        uint80 btcQty = 1 * 1e10;
+
         trader.executeBuy(usdtMargin, btcQty, 60_000 * 1e8, 0, 0);
 
         // Verify USDT is pulled from contract
         (uint256 usdtBal, uint256 btcBal) = trader.getBalances();
         assertEq(usdtBal, 0);
-        assertEq(btcBal, 0); 
+        assertEq(btcBal, 0);
 
         // Verify trade cycle state
         assertTrue(trader.hasActiveCycle());
@@ -138,7 +138,7 @@ contract AsterTraderTest is Test {
             uint80 qtyBTC,
             uint64 entryPrice,
             uint64 exitPrice,
-            int256 pnl,
+            int256 netCashFlow,
             bool active,
             uint256 startTime,
             uint256 endTime
@@ -150,10 +150,15 @@ contract AsterTraderTest is Test {
         assertEq(qtyBTC, btcQty);
         assertEq(entryPrice, 0); // Populated during close
         assertEq(exitPrice, 0);
-        assertEq(pnl, 0);
+        assertEq(netCashFlow, 0);
         assertTrue(active);
         assertEq(startTime, block.timestamp);
         assertEq(endTime, 0);
+
+        // Verify O(1) active cycle tracking
+        uint256[] memory activeIds = trader.getActiveCycleIds();
+        assertEq(activeIds.length, 1);
+        assertEq(activeIds[0], 0);
 
         // Step 3: Set BTC price to 66,000 USDT (in 1e8) -> Profit scenario
         router.setBtcPrice(66_000 * 1e8);
@@ -161,37 +166,34 @@ contract AsterTraderTest is Test {
         // Step 4: Execute Sell of Cycle 0
         trader.executeSell(0, tradeHash);
 
-        // Verify balances after sell
+        // Verify balances after sell (USDT is received, but cycle is not yet settled on contract)
         (usdtBal, btcBal) = trader.getBalances();
         assertEq(usdtBal, 66_000 * 1e18);
         assertEq(btcBal, 0);
+        assertTrue(trader.hasActiveCycle());
+
+        // Step 5: Settle manual close (simulating oracle)
+        trader.settleClose(0, 66_000 * 1e18, 66_000 * 1e8);
 
         // Verify trade cycle completed
         assertFalse(trader.hasActiveCycle());
         assertEq(trader.activeCyclesCount(), 0);
 
-        (
-            ,
-            storedHash,
-            ,
-            ,
-            entryPrice,
-            exitPrice,
-            pnl,
-            active,
-            ,
-            endTime
-        ) = trader.getTradeCycle(0);
+        (, storedHash,,, entryPrice, exitPrice, netCashFlow, active,, endTime) = trader.getTradeCycle(0);
 
         assertEq(storedHash, tradeHash);
         assertEq(entryPrice, 60_000 * 1e8);
         assertEq(exitPrice, 66_000 * 1e8);
-        assertEq(pnl, 6_000 * 1e18); 
+        assertEq(netCashFlow, 6_000 * 1e18);
         assertFalse(active);
         assertEq(endTime, block.timestamp);
 
-        // Check global PnL
-        assertEq(trader.totalPnL(), 6_000 * 1e18);
+        // Check global net cash flow
+        assertEq(trader.totalNetCashFlow(), 6_000 * 1e18);
+
+        // Verify active cycle IDs is now empty
+        activeIds = trader.getActiveCycleIds();
+        assertEq(activeIds.length, 0);
     }
 
     function testExecuteBuyAndSell_Loss() public {
@@ -215,10 +217,13 @@ contract AsterTraderTest is Test {
         // Step 3: Sell Cycle 0
         trader.executeSell(0, tradeHash);
 
-        // Verify trade cycle PnL
-        (,,,,,, int256 pnl,,,) = trader.getTradeCycle(0);
-        assertEq(pnl, -6_000 * 1e18); 
-        assertEq(trader.totalPnL(), -6_000 * 1e18);
+        // Step 4: Settle close
+        trader.settleClose(0, 54_000 * 1e18, 54_000 * 1e8);
+
+        // Verify trade cycle netCashFlow
+        (,,,,,, int256 netCashFlow,,,) = trader.getTradeCycle(0);
+        assertEq(netCashFlow, -6_000 * 1e18);
+        assertEq(trader.totalNetCashFlow(), -6_000 * 1e18);
     }
 
     // --- Concurrent Trades & Out-of-Order Sells Test (Grid Trading) ---
@@ -240,8 +245,8 @@ contract AsterTraderTest is Test {
         // Verify state
         assertEq(trader.activeCyclesCount(), 5);
         assertEq(trader.getTradeCyclesCount(), 5);
-        
-        (uint256 usdtBal, ) = trader.getBalances();
+
+        (uint256 usdtBal,) = trader.getBalances();
         assertEq(usdtBal, 0);
 
         IAsterDex.Position[] memory openPositions = trader.getMyPositions();
@@ -255,45 +260,47 @@ contract AsterTraderTest is Test {
         // Price increases: Sell Cycle 2 (out of order)
         router.setBtcPrice(70_000 * 1e8);
         trader.executeSell(2, hashes[2]);
+        trader.settleClose(2, 70_000 * 1e18, 70_000 * 1e8);
 
         // Verify Cycle 2 state
-        (,,,,, uint64 exitPrice, int256 pnl2, bool active2,,) = trader.getTradeCycle(2);
+        (,,,,, uint64 exitPrice, int256 netCashFlow2, bool active2,,) = trader.getTradeCycle(2);
         assertFalse(active2);
         assertEq(exitPrice, 70_000 * 1e8);
-        assertEq(pnl2, 10_000 * 1e18);
+        assertEq(netCashFlow2, 10_000 * 1e18);
 
         // Verify active cycle list doesn't include 2
         uint256[] memory activeIdsAfterFirstSell = trader.getActiveCycleIds();
         assertEq(activeIdsAfterFirstSell.length, 4);
         assertEq(activeIdsAfterFirstSell[0], 0);
         assertEq(activeIdsAfterFirstSell[1], 1);
-        assertEq(activeIdsAfterFirstSell[2], 3);
-        assertEq(activeIdsAfterFirstSell[3], 4);
+        assertEq(activeIdsAfterFirstSell[2], 4); // index 3 swapped with 4 on pop
+        assertEq(activeIdsAfterFirstSell[3], 3);
         assertEq(trader.activeCyclesCount(), 4);
 
         // Price decreases: Sell Cycle 0 (loss)
         router.setBtcPrice(50_000 * 1e8);
         trader.executeSell(0, hashes[0]);
+        trader.settleClose(0, 50_000 * 1e18, 50_000 * 1e8);
 
         // Verify Cycle 0 state
-        (,,,,,, int256 pnl0, bool active0,,) = trader.getTradeCycle(0);
+        (,,,,,, int256 netCashFlow0, bool active0,,) = trader.getTradeCycle(0);
         assertFalse(active0);
-        assertEq(pnl0, -10_000 * 1e18);
+        assertEq(netCashFlow0, -10_000 * 1e18);
 
         // Verify active cycle list doesn't include 0 or 2
         uint256[] memory activeIdsAfterSecondSell = trader.getActiveCycleIds();
         assertEq(activeIdsAfterSecondSell.length, 3);
-        assertEq(activeIdsAfterSecondSell[0], 1);
-        assertEq(activeIdsAfterSecondSell[1], 3);
+        assertEq(activeIdsAfterSecondSell[0], 3); // index 0 swapped with 3
+        assertEq(activeIdsAfterSecondSell[1], 1);
         assertEq(activeIdsAfterSecondSell[2], 4);
         assertEq(trader.activeCyclesCount(), 3);
 
-        // Verify cumulative PnL: +10,000 + (-10,000) = 0
-        assertEq(trader.totalPnL(), 0);
+        // Verify cumulative net cash flow: +10,000 + (-10,000) = 0
+        assertEq(trader.totalNetCashFlow(), 0);
 
         // Verify remaining token balances
-        (usdtBal, ) = trader.getBalances();
-        assertEq(usdtBal, 120_000 * 1e18); 
+        (usdtBal,) = trader.getBalances();
+        assertEq(usdtBal, 120_000 * 1e18);
     }
 
     // --- State Invariants & Boundary Tests ---
@@ -319,6 +326,7 @@ contract AsterTraderTest is Test {
 
         // Sell one cycle to free up space
         trader.executeSell(0, hash0);
+        trader.settleClose(0, 60_000 * 1e18, 60_000 * 1e8);
         assertEq(trader.activeCyclesCount(), 4);
 
         // Now the 6th buy should succeed
@@ -336,11 +344,12 @@ contract AsterTraderTest is Test {
 
         // Buy and then sell to close Cycle 0
         trader.executeBuy(60_000 * 1e18, 1 * 1e10, 60_000 * 1e8, 0, 0);
-        
+
         IAsterDex.Position[] memory openPositions = trader.getMyPositions();
         bytes32 hash0 = openPositions[0].positionHash;
 
         trader.executeSell(0, hash0);
+        trader.settleClose(0, 60_000 * 1e18, 60_000 * 1e8);
 
         // Attempting to sell Cycle 0 again should revert
         vm.expectRevert("AsterTrader: trade cycle is not active");
@@ -393,8 +402,86 @@ contract AsterTraderTest is Test {
         assertFalse(trader.hasActiveCycle());
         assertEq(trader.activeCyclesCount(), 0);
 
-        (,,,,,, int256 pnl,,,) = trader.getTradeCycle(0);
-        assertEq(pnl, 3_000 * 1e18);
-        assertEq(trader.totalPnL(), 3_000 * 1e18);
+        (,,,,,, int256 netCashFlow,,,) = trader.getTradeCycle(0);
+        assertEq(netCashFlow, 3_000 * 1e18);
+        assertEq(trader.totalNetCashFlow(), 3_000 * 1e18);
+    }
+
+    // --- New Tests for ASTER-1, ASTER-2, ASTER-4 ---
+
+    function testForceMarkClosed() public {
+        // Setup trade
+        uint256 depositAmt = 60_000 * 1e18;
+        usdt.approve(address(trader), depositAmt);
+        trader.depositUSDT(depositAmt);
+
+        router.setBtcPrice(60_000 * 1e8);
+        trader.executeBuy(60_000 * 1e18, 1 * 1e10, 60_000 * 1e8, 0, 0);
+
+        IAsterDex.Position[] memory openPositions = trader.getMyPositions();
+        bytes32 tradeHash = openPositions[0].positionHash;
+
+        // Try to force close while position still exists on Aster -> should revert
+        vm.expectRevert("AsterTrader: Aster position is not gone");
+        trader.forceMarkClosed(0, tradeHash);
+
+        // Simulate position cleared by Aster (TP/SL/liquidation) by deleting it in Mock DEX
+        router.closeTrade(tradeHash);
+
+        // Now force close should succeed
+        trader.forceMarkClosed(0, tradeHash);
+
+        // Verify cycle is closed and inactive
+        (,,,,,, int256 netCashFlow, bool active,,) = trader.getTradeCycle(0);
+        assertFalse(active);
+        assertEq(netCashFlow, 0); // No payout recorded since it was forced
+        assertEq(trader.activeCyclesCount(), 0);
+        assertEq(trader.getActiveCycleIds().length, 0);
+    }
+
+    function testRescueToken() public {
+        // Mint mock BTC to the trader contract
+        uint256 btcAmount = 2 * 1e18;
+        btc.mint(address(trader), btcAmount);
+
+        // Verify balance
+        (, uint256 btcBal) = trader.getBalances();
+        assertEq(btcBal, btcAmount);
+
+        // Try to rescue USDT -> should revert
+        vm.expectRevert("AsterTrader: cannot rescue USDT");
+        trader.rescueToken(USDT, 100 * 1e18);
+
+        // Rescue BTC
+        trader.rescueToken(address(btc), btcAmount);
+
+        // Verify balance after rescue
+        (, btcBal) = trader.getBalances();
+        assertEq(btcBal, 0);
+        assertEq(btc.balanceOf(owner), btcAmount);
+    }
+
+    function testCannotReuseTradeHash() public {
+        uint256 depositAmt = 120_000 * 1e18;
+        usdt.approve(address(trader), depositAmt);
+        trader.depositUSDT(depositAmt);
+
+        router.setBtcPrice(60_000 * 1e8);
+        trader.executeBuy(60_000 * 1e18, 1 * 1e10, 60_000 * 1e8, 0, 0);
+        trader.executeBuy(60_000 * 1e18, 1 * 1e10, 60_000 * 1e8, 0, 0);
+
+        IAsterDex.Position[] memory openPositions = trader.getMyPositions();
+        bytes32 hash0 = openPositions[0].positionHash;
+        bytes32 hash1 = openPositions[1].positionHash;
+
+        // Associate hash0 with cycle 0 in executeSell
+        trader.executeSell(0, hash0);
+
+        // Attempting to use hash0 for cycle 1 should revert
+        vm.expectRevert("AsterTrader: tradeHash already used");
+        trader.executeSell(1, hash0);
+
+        // Using hash1 for cycle 1 should succeed
+        trader.executeSell(1, hash1);
     }
 }

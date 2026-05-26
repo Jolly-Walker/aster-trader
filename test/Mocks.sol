@@ -8,7 +8,7 @@ contract MockUSDT {
     string public constant symbol = "USDT";
     uint8 public constant decimals = 18;
     uint256 public totalSupply;
-    
+
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
@@ -53,7 +53,7 @@ contract MockBTC {
     string public constant symbol = "BTC";
     uint8 public constant decimals = 18;
     uint256 public totalSupply;
-    
+
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 
@@ -169,7 +169,7 @@ contract MockAsterDex is IAsterDex {
 
         // Delete position records
         delete positions[tradeHash];
-        
+
         // Remove hash from user list
         bytes32[] storage hashes = userPositions[msg.sender];
         for (uint256 i = 0; i < hashes.length; i++) {
@@ -193,12 +193,9 @@ contract MockAsterDex is IAsterDex {
     function updateTradeTp(bytes32 tradeHash, uint64 takeProfit) external override {}
     function updateTradeSl(bytes32 tradeHash, uint64 stopLoss) external override {}
 
-    function getPositionsV2(
-        address user,
-        address pairBase
-    ) external view override returns (Position[] memory) {
+    function getPositionsV2(address user, address pairBase) external view override returns (Position[] memory) {
         bytes32[] memory hashes = userPositions[user];
-        
+
         // Count matching pairs
         uint256 count = 0;
         for (uint256 i = 0; i < hashes.length; i++) {

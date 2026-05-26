@@ -11,7 +11,7 @@ import {IAsterDex, IERC20, ASTER_DEX, BTC_PAIR_BASE, USDT} from "./Interface/IAs
 contract AsterTrader {
     // Ownership
     address public owner;
-    
+
     // Reentrancy status
     uint256 private constant _NOT_ENTERED = 1;
     uint256 private constant _ENTERED = 2;
@@ -19,46 +19,37 @@ contract AsterTrader {
 
     // Trade Cycle Tracking
     struct TradeCycle {
-        uint256 id;
-        bytes32 tradeHash;       // The unique hash of the position on Aster DEX
-        uint96 marginUSDT;       // USDT margin spent
-        uint80 qtyBTC;           // BTC quantity in 1e10
-        uint64 entryPrice;       // BTC price in 1e8 when opened
-        uint64 exitPrice;        // BTC price in 1e8 when closed
-        int256 pnl;              // Realized PnL in USDT (18 decimals)
-        bool active;             // True if bought but not yet closed
+        bytes32 tradeHash; // The unique hash of the position on Aster DEX
+        uint96 marginUSDT; // USDT margin spent
+        uint80 qtyBTC; // BTC quantity in 1e10
+        uint64 entryPrice; // BTC price in 1e8 when opened
+        uint64 exitPrice; // BTC price in 1e8 when closed
+        int256 netCashFlow; // Realized net cash flow in USDT after all fees (18 decimals)
+        bool active; // True if bought but not yet closed
         uint256 startTime;
         uint256 endTime;
     }
 
     TradeCycle[] public tradeCycles;
-    int256 public totalPnL;
+    int256 public totalNetCashFlow;
     uint256 public activeCyclesCount; // Number of currently active trade cycles
+
+    // Active cycle ID tracking (for O(1) active cycle lookup)
+    uint256[] public activeCycleIds;
+
+    // Track used trade hashes to prevent mismatches
+    mapping(bytes32 => bool) public tradeHashUsed;
 
     // Events
     event USDTDeposited(address indexed user, uint256 amount);
     event USDTWithdrawn(address indexed owner, uint256 amount);
-    event BTCWithdrawn(address indexed owner, uint256 amount);
+    event TokenRescued(address indexed token, address indexed to, uint256 amount);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
-    event BoughtBTC(
-        uint256 indexed cycleId,
-        uint96 usdtMargin,
-        uint80 btcQty,
-        uint256 timestamp
-    );
-    event SoldBTC(
-        uint256 indexed cycleId,
-        uint80 btcSold,
-        uint256 usdtReceived,
-        int256 pnl,
-        uint256 timestamp
-    );
-    event CloseInitiated(
-        uint256 indexed cycleId,
-        bytes32 indexed tradeHash,
-        uint256 timestamp
-    );
+    event BoughtBTC(uint256 indexed cycleId, uint96 usdtMargin, uint80 btcQty, uint256 timestamp);
+    event SoldBTC(uint256 indexed cycleId, uint80 btcSold, uint256 usdtReceived, int256 netCashFlow, uint256 timestamp);
+    event CloseInitiated(uint256 indexed cycleId, bytes32 indexed tradeHash, uint256 timestamp);
+    event ForceClosed(uint256 indexed cycleId, bytes32 indexed tradeHash, uint256 timestamp);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "AsterTrader: caller is not the owner");
@@ -75,6 +66,8 @@ contract AsterTrader {
     constructor() {
         owner = msg.sender;
         _status = _NOT_ENTERED;
+        // Pre-approve Aster DEX to spend USDT margin up to max value
+        _safeApprove(USDT, ASTER_DEX, type(uint256).max);
     }
 
     /**
@@ -100,15 +93,17 @@ contract AsterTrader {
     }
 
     /**
-     * @notice Withdraw BTC back to the owner (if direct BTC payout occurs)
-     * @param amount The amount of BTC to withdraw
+     * @notice Rescue any non-USDT tokens stuck in the contract
+     * @param token The token address to rescue
+     * @param amount The amount to rescue
      */
-    function withdrawBTC(uint256 amount) external onlyOwner nonReentrant {
-        require(amount > 0, "AsterTrader: withdraw amount must be > 0");
-        uint256 balance = IERC20(BTC_PAIR_BASE).balanceOf(address(this));
-        require(balance >= amount, "AsterTrader: insufficient BTC balance");
-        _safeTransfer(BTC_PAIR_BASE, owner, amount);
-        emit BTCWithdrawn(owner, amount);
+    function rescueToken(address token, uint256 amount) external onlyOwner nonReentrant {
+        require(token != USDT, "AsterTrader: cannot rescue USDT");
+        require(amount > 0, "AsterTrader: rescue amount must be > 0");
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        require(balance >= amount, "AsterTrader: insufficient balance to rescue");
+        _safeTransfer(token, owner, amount);
+        emit TokenRescued(token, owner, amount);
     }
 
     /**
@@ -130,53 +125,50 @@ contract AsterTrader {
      * @param stopLoss Stop loss price (8 decimals, 0 to disable)
      * @param takeProfit Take profit price (8 decimals, 0 to disable)
      */
-    function executeBuy(
-        uint96 usdtMargin,
-        uint80 btcQty,
-        uint64 worstPrice,
-        uint64 stopLoss,
-        uint64 takeProfit
-    ) external onlyOwner nonReentrant returns (uint256 cycleId) {
+    function executeBuy(uint96 usdtMargin, uint80 btcQty, uint64 worstPrice, uint64 stopLoss, uint64 takeProfit)
+        external
+        onlyOwner
+        nonReentrant
+        returns (uint256 cycleId)
+    {
         require(usdtMargin > 0, "AsterTrader: buy amount must be > 0");
         require(activeCyclesCount < 5, "AsterTrader: maximum concurrent active cycles reached");
-        
+
         uint256 contractUsdtBalance = IERC20(USDT).balanceOf(address(this));
         require(contractUsdtBalance >= usdtMargin, "AsterTrader: insufficient USDT in contract");
 
-        // Approve Aster DEX to spend USDT margin
-        _safeApprove(USDT, ASTER_DEX, usdtMargin);
-
-        // Call Aster DEX
-        IAsterDex(ASTER_DEX).openMarketTrade(
-            IAsterDex.OpenDataInput({
-                pairBase: BTC_PAIR_BASE,
-                isLong: true,
-                tokenIn: USDT,
-                amountIn: usdtMargin,
-                qty: btcQty,
-                price: worstPrice,
-                stopLoss: stopLoss,
-                takeProfit: takeProfit,
-                broker: 0
-            })
-        );
+        // Call Aster DEX (USDT already pre-approved in constructor)
+        IAsterDex(ASTER_DEX)
+            .openMarketTrade(
+                IAsterDex.OpenDataInput({
+                    pairBase: BTC_PAIR_BASE,
+                    isLong: true,
+                    tokenIn: USDT,
+                    amountIn: usdtMargin,
+                    qty: btcQty,
+                    price: worstPrice,
+                    stopLoss: stopLoss,
+                    takeProfit: takeProfit,
+                    broker: 0
+                })
+            );
 
         cycleId = tradeCycles.length;
         tradeCycles.push(
             TradeCycle({
-                id: cycleId,
                 tradeHash: bytes32(0), // Set during close
                 marginUSDT: usdtMargin,
                 qtyBTC: btcQty,
                 entryPrice: 0,
                 exitPrice: 0,
-                pnl: 0,
+                netCashFlow: 0,
                 active: true,
                 startTime: block.timestamp,
                 endTime: 0
             })
         );
 
+        activeCycleIds.push(cycleId);
         activeCyclesCount++;
 
         emit BoughtBTC(cycleId, usdtMargin, btcQty, block.timestamp);
@@ -188,13 +180,20 @@ contract AsterTrader {
      * @param cycleId Unique identifier of the active trade cycle to end
      * @param tradeHash Unique transaction hash of the position on Aster DEX
      */
-    function executeSell(
-        uint256 cycleId,
-        bytes32 tradeHash
-    ) external onlyOwner nonReentrant returns (uint256 usdtReceived) {
+    function executeSell(uint256 cycleId, bytes32 tradeHash) external onlyOwner nonReentrant {
         require(cycleId < tradeCycles.length, "AsterTrader: invalid trade cycle ID");
         TradeCycle storage cycle = tradeCycles[cycleId];
         require(cycle.active, "AsterTrader: trade cycle is not active");
+
+        // Verify/set tradeHash
+        if (cycle.tradeHash == bytes32(0)) {
+            require(tradeHash != bytes32(0), "AsterTrader: tradeHash cannot be empty");
+            require(!tradeHashUsed[tradeHash], "AsterTrader: tradeHash already used");
+            cycle.tradeHash = tradeHash;
+            tradeHashUsed[tradeHash] = true;
+        } else {
+            require(cycle.tradeHash == tradeHash, "AsterTrader: tradeHash mismatch");
+        }
 
         // Query position details from Aster to verify it exists and belongs to us
         IAsterDex.Position memory pos = IAsterDex(ASTER_DEX).getPositionByHashV2(tradeHash);
@@ -202,53 +201,26 @@ contract AsterTrader {
         require(pos.marginToken == USDT, "AsterTrader: invalid margin token");
         require(pos.pairBase == BTC_PAIR_BASE, "AsterTrader: invalid pairBase");
 
-        cycle.tradeHash = tradeHash;
         cycle.qtyBTC = pos.qty;
         cycle.entryPrice = pos.entryPrice;
-
-        uint256 balanceBefore = IERC20(USDT).balanceOf(address(this));
 
         // Call Aster DEX to close trade
         IAsterDex(ASTER_DEX).closeTrade(tradeHash);
 
-        uint256 balanceAfter = IERC20(USDT).balanceOf(address(this));
-
-        // Verify if the position has been cleared from Aster DEX storage immediately (synchronous mock check)
-        IAsterDex.Position memory posAfter = IAsterDex(ASTER_DEX).getPositionByHashV2(tradeHash);
-        bool isCleared = (posAfter.margin == 0);
-
-        if (isCleared) {
-            // Synchronous settlement (Mock / Test execution)
-            usdtReceived = balanceAfter > balanceBefore ? (balanceAfter - balanceBefore) : 0;
-            
-            cycle.endTime = block.timestamp;
-            cycle.active = false;
-            cycle.exitPrice = uint64(IAsterDex(ASTER_DEX).getPrice(BTC_PAIR_BASE));
-
-            int256 cyclePnL = int256(usdtReceived) - int256(uint256(cycle.marginUSDT));
-            cycle.pnl = cyclePnL;
-
-            totalPnL += cyclePnL;
-            activeCyclesCount--;
-
-            emit SoldBTC(cycleId, pos.qty, usdtReceived, cyclePnL, block.timestamp);
-        } else {
-            // Asynchronous settlement (BSC Mainnet)
-            emit CloseInitiated(cycleId, tradeHash, block.timestamp);
-        }
+        emit CloseInitiated(cycleId, tradeHash, block.timestamp);
     }
 
     /**
-     * @notice Finalize trade cycle and record PnL on contract once oracle settles asynchronously
+     * @notice Finalize trade cycle and record net cash flow once oracle settles asynchronously
      * @param cycleId Unique identifier of the trade cycle
      * @param actualUsdtReceived Actual USDT amount received from Aster DEX (18 decimals)
      * @param exitPrice Execution price from Oracle (8 decimals)
      */
-    function settleClose(
-        uint256 cycleId,
-        uint256 actualUsdtReceived,
-        uint64 exitPrice
-    ) external onlyOwner nonReentrant {
+    function settleClose(uint256 cycleId, uint256 actualUsdtReceived, uint64 exitPrice)
+        external
+        onlyOwner
+        nonReentrant
+    {
         require(cycleId < tradeCycles.length, "AsterTrader: invalid trade cycle ID");
         TradeCycle storage cycle = tradeCycles[cycleId];
         require(cycle.active, "AsterTrader: trade cycle is not active");
@@ -257,13 +229,93 @@ contract AsterTrader {
         cycle.active = false;
         cycle.exitPrice = exitPrice;
 
-        int256 cyclePnL = int256(actualUsdtReceived) - int256(uint256(cycle.marginUSDT));
-        cycle.pnl = cyclePnL;
+        int256 cycleNetCashFlow = int256(actualUsdtReceived) - int256(uint256(cycle.marginUSDT));
+        cycle.netCashFlow = cycleNetCashFlow;
 
-        totalPnL += cyclePnL;
+        totalNetCashFlow += cycleNetCashFlow;
+        _removeFromActiveIds(cycleId);
         activeCyclesCount--;
 
-        emit SoldBTC(cycleId, cycle.qtyBTC, actualUsdtReceived, cyclePnL, block.timestamp);
+        emit SoldBTC(cycleId, cycle.qtyBTC, actualUsdtReceived, cycleNetCashFlow, block.timestamp);
+    }
+
+    /**
+     * @notice Force mark a trade cycle closed if it was closed/liquidated on Aster directly
+     * @param cycleId Unique identifier of the trade cycle
+     */
+    function forceMarkClosed(uint256 cycleId) external onlyOwner nonReentrant {
+        _forceMarkClosed(cycleId, bytes32(0));
+    }
+
+    /**
+     * @notice Force mark a trade cycle closed with specific tradeHash if not already associated
+     * @param cycleId Unique identifier of the trade cycle
+     * @param tradeHash Trade hash from Aster DEX
+     */
+    function forceMarkClosed(uint256 cycleId, bytes32 tradeHash) external onlyOwner nonReentrant {
+        _forceMarkClosed(cycleId, tradeHash);
+    }
+
+    /**
+     * @notice Associate a trade hash with an active trade cycle
+     * @param cycleId Unique identifier of the trade cycle
+     * @param tradeHash Trade hash from Aster DEX
+     */
+    function setTradeHash(uint256 cycleId, bytes32 tradeHash) external onlyOwner {
+        require(cycleId < tradeCycles.length, "AsterTrader: invalid trade cycle ID");
+        TradeCycle storage cycle = tradeCycles[cycleId];
+        require(cycle.active, "AsterTrader: trade cycle is not active");
+        require(cycle.tradeHash == bytes32(0), "AsterTrader: tradeHash already set");
+        require(tradeHash != bytes32(0), "AsterTrader: tradeHash cannot be empty");
+        require(!tradeHashUsed[tradeHash], "AsterTrader: tradeHash already used");
+
+        cycle.tradeHash = tradeHash;
+        tradeHashUsed[tradeHash] = true;
+    }
+
+    /**
+     * @notice Internal helper to force mark a cycle closed
+     */
+    function _forceMarkClosed(uint256 cycleId, bytes32 tradeHash) internal {
+        require(cycleId < tradeCycles.length, "AsterTrader: invalid trade cycle ID");
+        TradeCycle storage cycle = tradeCycles[cycleId];
+        require(cycle.active, "AsterTrader: trade cycle is not active");
+
+        if (cycle.tradeHash == bytes32(0)) {
+            require(tradeHash != bytes32(0), "AsterTrader: tradeHash required");
+            require(!tradeHashUsed[tradeHash], "AsterTrader: tradeHash already used");
+            cycle.tradeHash = tradeHash;
+            tradeHashUsed[tradeHash] = true;
+        } else {
+            if (tradeHash != bytes32(0)) {
+                require(cycle.tradeHash == tradeHash, "AsterTrader: tradeHash mismatch");
+            }
+        }
+
+        IAsterDex.Position memory pos = IAsterDex(ASTER_DEX).getPositionByHashV2(cycle.tradeHash);
+        require(pos.margin == 0, "AsterTrader: Aster position is not gone");
+
+        cycle.endTime = block.timestamp;
+        cycle.active = false;
+
+        _removeFromActiveIds(cycleId);
+        activeCyclesCount--;
+
+        emit ForceClosed(cycleId, cycle.tradeHash, block.timestamp);
+    }
+
+    /**
+     * @notice Internal helper to remove a cycleId from the activeCycleIds array
+     */
+    function _removeFromActiveIds(uint256 cycleId) internal {
+        uint256 len = activeCycleIds.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (activeCycleIds[i] == cycleId) {
+                activeCycleIds[i] = activeCycleIds[len - 1];
+                activeCycleIds.pop();
+                break;
+            }
+        }
     }
 
     /**
@@ -277,28 +329,32 @@ contract AsterTrader {
      * @notice View function to get a specific trade cycle detail
      * @param index The index of the cycle in the array
      */
-    function getTradeCycle(uint256 index) external view returns (
-        uint256 id,
-        bytes32 tradeHash,
-        uint96 marginUSDT,
-        uint80 qtyBTC,
-        uint64 entryPrice,
-        uint64 exitPrice,
-        int256 pnl,
-        bool active,
-        uint256 startTime,
-        uint256 endTime
-    ) {
+    function getTradeCycle(uint256 index)
+        external
+        view
+        returns (
+            uint256 id,
+            bytes32 tradeHash,
+            uint96 marginUSDT,
+            uint80 qtyBTC,
+            uint64 entryPrice,
+            uint64 exitPrice,
+            int256 netCashFlow,
+            bool active,
+            uint256 startTime,
+            uint256 endTime
+        )
+    {
         require(index < tradeCycles.length, "AsterTrader: index out of bounds");
         TradeCycle memory cycle = tradeCycles[index];
         return (
-            cycle.id,
+            index, // id is derived from index
             cycle.tradeHash,
             cycle.marginUSDT,
             cycle.qtyBTC,
             cycle.entryPrice,
             cycle.exitPrice,
-            cycle.pnl,
+            cycle.netCashFlow,
             cycle.active,
             cycle.startTime,
             cycle.endTime
@@ -308,7 +364,7 @@ contract AsterTrader {
     /**
      * @notice Checks if there is currently any active trade cycles
      */
-    function hasActiveCycle() public view returns (bool) {
+    function hasActiveCycle() external view returns (bool) {
         return activeCyclesCount > 0;
     }
 
@@ -316,25 +372,14 @@ contract AsterTrader {
      * @notice Returns array of all active cycle IDs
      */
     function getActiveCycleIds() external view returns (uint256[] memory) {
-        uint256[] memory activeIds = new uint256[](activeCyclesCount);
-        uint256 count = 0;
-        for (uint256 i = 0; i < tradeCycles.length; i++) {
-            if (tradeCycles[i].active) {
-                activeIds[count] = i;
-                count++;
-            }
-        }
-        return activeIds;
+        return activeCycleIds;
     }
 
     /**
      * @notice View the current token balances in the contract
      */
     function getBalances() external view returns (uint256 usdtBalance, uint256 btcBalance) {
-        return (
-            IERC20(USDT).balanceOf(address(this)),
-            IERC20(BTC_PAIR_BASE).balanceOf(address(this))
-        );
+        return (IERC20(USDT).balanceOf(address(this)), IERC20(BTC_PAIR_BASE).balanceOf(address(this)));
     }
 
     /**
@@ -360,7 +405,7 @@ contract AsterTrader {
     function _safeApprove(address token, address spender, uint256 value) internal {
         (bool success, bytes memory data) = token.call(abi.encodeWithSelector(0x095ea7b3, spender, 0));
         require(success && (data.length == 0 || abi.decode(data, (bool))), "SafeERC20: approve reset failed");
-        
+
         (success, data) = token.call(abi.encodeWithSelector(0x095ea7b3, spender, value));
         require(success && (data.length == 0 || abi.decode(data, (bool))), "SafeERC20: approve value failed");
     }

@@ -32,7 +32,6 @@ address constant USDT = 0x55d398326f99059fF775485246999027B3197955;
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface IAsterDex {
-
     // ─── Core input struct ────────────────────────────────────────────────────
     //
     // Used by openMarketTrade, openMarketTradeBNB, and openLimitOrder.
@@ -109,11 +108,7 @@ interface IAsterDex {
     function addMargin(bytes32 tradeHash, uint96 amount) external payable;
 
     // Update take-profit and stop-loss on an open position.
-    function updateTradeTpAndSl(
-        bytes32 tradeHash,
-        uint64 takeProfit,
-        uint64 stopLoss
-    ) external;
+    function updateTradeTpAndSl(bytes32 tradeHash, uint64 takeProfit, uint64 stopLoss) external;
 
     function updateTradeTp(bytes32 tradeHash, uint64 takeProfit) external;
     function updateTradeSl(bytes32 tradeHash, uint64 stopLoss) external;
@@ -122,32 +117,28 @@ interface IAsterDex {
 
     struct Position {
         bytes32 positionHash;
-        string  pair;           // e.g. "BTC/USD"
+        string pair; // e.g. "BTC/USD"
         address pairBase;
         address marginToken;
-        bool    isLong;
-        uint96  margin;
-        uint80  qty;
-        uint64  entryPrice;
-        uint64  stopLoss;
-        uint64  takeProfit;
-        uint96  openFee;
-        uint96  executionFee;
-        int256  fundingFee;
-        uint40  timestamp;
-        uint96  holdingFee;
+        bool isLong;
+        uint96 margin;
+        uint80 qty;
+        uint64 entryPrice;
+        uint64 stopLoss;
+        uint64 takeProfit;
+        uint96 openFee;
+        uint96 executionFee;
+        int256 fundingFee;
+        uint40 timestamp;
+        uint96 holdingFee;
     }
 
     // Get all open positions for a user on a given pair.
     // Pass address(0) for pairBase to get positions across all pairs.
-    function getPositionsV2(
-        address user,
-        address pairBase
-    ) external view returns (Position[] memory);
+    function getPositionsV2(address user, address pairBase) external view returns (Position[] memory);
 
     // Get a single position by its trade hash.
-    function getPositionByHashV2(bytes32 tradeHash)
-        external view returns (Position memory);
+    function getPositionByHashV2(bytes32 tradeHash) external view returns (Position memory);
 
     // ─── Price helpers ────────────────────────────────────────────────────────
 
@@ -156,17 +147,13 @@ interface IAsterDex {
 
     // ─── Events (for your contract to listen/index) ───────────────────────────
 
-    event MarketPendingTrade(
-        address indexed user,
-        bytes32 indexed tradeHash,
-        OpenDataInput data
-    );
+    event MarketPendingTrade(address indexed user, bytes32 indexed tradeHash, OpenDataInput data);
 
     event OpenMarketTrade(
         address indexed user,
         bytes32 indexed tradeHash,
         // Full OpenTrade struct emitted — use tradeHash for subsequent calls
-        bytes   ot  // abi-encoded ITrading.OpenTrade — decode off-chain
+        bytes ot // abi-encoded ITrading.OpenTrade — decode off-chain
     );
 
     event CloseTradeSuccessful(
@@ -176,7 +163,6 @@ interface IAsterDex {
         bytes closeInfo
     );
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Example usage contract
@@ -190,7 +176,6 @@ interface IERC20 {
 }
 
 contract AsterBtcTrader {
-
     // ── Constants ──────────────────────────────────────────────────────────────
     IAsterDex public constant ASTER = IAsterDex(ASTER_DEX);
 
@@ -218,27 +203,26 @@ contract AsterBtcTrader {
     // @param stopLoss     Stop-loss price in 1e8. Pass 0 to disable.
     // @param takeProfit   Take-profit price in 1e8. Pass 0 to disable.
     //
-    function buyBtc(
-        uint96 usdtMargin,
-        uint80 btcQty,
-        uint64 worstPrice,
-        uint64 stopLoss,
-        uint64 takeProfit
-    ) external onlyOwner {
+    function buyBtc(uint96 usdtMargin, uint80 btcQty, uint64 worstPrice, uint64 stopLoss, uint64 takeProfit)
+        external
+        onlyOwner
+    {
         // Pull USDT from caller into this contract first
         IERC20(USDT).transferFrom(msg.sender, address(this), usdtMargin);
 
-        ASTER.openMarketTrade(IAsterDex.OpenDataInput({
-            pairBase:   BTC_PAIR_BASE,
-            isLong:     true,           // Long = buy BTC
-            tokenIn:    USDT,
-            amountIn:   usdtMargin,
-            qty:        btcQty,
-            price:      worstPrice,
-            stopLoss:   stopLoss,
-            takeProfit: takeProfit,
-            broker:     0               // no broker ID
-        }));
+        ASTER.openMarketTrade(
+            IAsterDex.OpenDataInput({
+                pairBase: BTC_PAIR_BASE,
+                isLong: true, // Long = buy BTC
+                tokenIn: USDT,
+                amountIn: usdtMargin,
+                qty: btcQty,
+                price: worstPrice,
+                stopLoss: stopLoss,
+                takeProfit: takeProfit,
+                broker: 0 // no broker ID
+            })
+        );
     }
 
     // ── Open a BTC Short (sell BTC) ───────────────────────────────────────────
@@ -246,26 +230,25 @@ contract AsterBtcTrader {
     // @param worstPrice  For a short, set this ABOVE current price (slippage guard
     //                    means: reject if oracle fills below this price).
     //
-    function sellBtc(
-        uint96 usdtMargin,
-        uint80 btcQty,
-        uint64 worstPrice,
-        uint64 stopLoss,
-        uint64 takeProfit
-    ) external onlyOwner {
+    function sellBtc(uint96 usdtMargin, uint80 btcQty, uint64 worstPrice, uint64 stopLoss, uint64 takeProfit)
+        external
+        onlyOwner
+    {
         IERC20(USDT).transferFrom(msg.sender, address(this), usdtMargin);
 
-        ASTER.openMarketTrade(IAsterDex.OpenDataInput({
-            pairBase:   BTC_PAIR_BASE,
-            isLong:     false,          // Short = sell BTC
-            tokenIn:    USDT,
-            amountIn:   usdtMargin,
-            qty:        btcQty,
-            price:      worstPrice,
-            stopLoss:   stopLoss,
-            takeProfit: takeProfit,
-            broker:     0
-        }));
+        ASTER.openMarketTrade(
+            IAsterDex.OpenDataInput({
+                pairBase: BTC_PAIR_BASE,
+                isLong: false, // Short = sell BTC
+                tokenIn: USDT,
+                amountIn: usdtMargin,
+                qty: btcQty,
+                price: worstPrice,
+                stopLoss: stopLoss,
+                takeProfit: takeProfit,
+                broker: 0
+            })
+        );
     }
 
     // ── Close any open position ────────────────────────────────────────────────
@@ -278,10 +261,7 @@ contract AsterBtcTrader {
     }
 
     // ── Read your open BTC positions ───────────────────────────────────────────
-    function getMyBtcPositions()
-        external view
-        returns (IAsterDex.Position[] memory)
-    {
+    function getMyBtcPositions() external view returns (IAsterDex.Position[] memory) {
         return ASTER.getPositionsV2(address(this), BTC_PAIR_BASE);
     }
 
