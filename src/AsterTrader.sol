@@ -141,16 +141,16 @@ contract AsterTrader {
         IAsterDex(ASTER_DEX)
             .openMarketTrade(
                 IAsterDex.OpenDataInput({
-                    pairBase: BTC_PAIR_BASE,
-                    isLong: true,
-                    tokenIn: USDT,
-                    amountIn: usdtMargin,
-                    qty: btcQty,
-                    price: worstPrice,
-                    stopLoss: stopLoss,
-                    takeProfit: takeProfit,
-                    broker: 0
-                })
+                pairBase: BTC_PAIR_BASE,
+                isLong: true,
+                tokenIn: USDT,
+                amountIn: usdtMargin,
+                qty: btcQty,
+                price: worstPrice,
+                stopLoss: stopLoss,
+                takeProfit: takeProfit,
+                broker: 0
+            })
             );
 
         cycleId = tradeCycles.length;
